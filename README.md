@@ -2,7 +2,8 @@
 
 This image runs the requested Streamlit frontend and LangGraph backend in one
 non-root container. PostgreSQL is external (for example, Supabase); FAISS
-indexes and uploaded PDFs are stored in the named `rag_stores` volume.
+indexes and uploaded PDFs are stored in the named `rag_stores` volume for local
+Docker Compose use.
 
 ## Configure secrets
 
@@ -47,6 +48,8 @@ the persisted FAISS indexes and uploaded PDFs.
 
 ## Hosted storage limitation
 
-The named volume is suitable for one Docker host. For multi-host deployment,
-move `/app/data/rag_stores` to durable shared object storage or a managed file
-volume before scaling beyond one container.
+The named volume is suitable for one local Docker host. Render Free does not
+provide durable local storage: uploaded PDFs and FAISS indexes stored under
+`/app/data/rag_stores` may disappear after a restart or redeploy. For
+multi-host or durable deployment, move `/app/data/rag_stores` to durable shared
+object storage or a managed file volume before scaling beyond one container.

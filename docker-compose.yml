@@ -1,0 +1,17 @@
+services:
+  chatbot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    environment:
+      RAG_STORE_DIR: /app/data/rag_stores
+    volumes:
+      - rag_stores:/app/data/rag_stores
+    restart: unless-stopped
+
+volumes:
+  rag_stores:

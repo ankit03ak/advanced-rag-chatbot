@@ -15,8 +15,14 @@ DATABASE_URL=postgresql://...?...sslmode=require
 ALPHA_VANTAGE_API_KEY=...
 ```
 
-Do not commit `.env`. The database URL and API keys are passed at runtime and
-are not copied into the image.
+
+
+When PostgreSQL is enabled, the application uses separate conservative pools
+for authentication and LangGraph checkpoints. Each defaults to a maximum of
+two connections, for a combined application maximum of four connections per
+process. Override `POSTGRES_AUTH_POOL_MAX_SIZE` and
+`POSTGRES_CHECKPOINT_POOL_MAX_SIZE` only when the Supabase or PostgreSQL
+connection budget supports the larger combined maximum.
 
 ## Start
 

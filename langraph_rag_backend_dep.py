@@ -28,6 +28,7 @@ import shutil
 import threading
 import time
 import uuid
+import atexit
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -50,25 +51,86 @@ ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY")
 AUTH_SESSION_TTL = timedelta(hours=12)
 DATABASE_URL = os.getenv("DATABASE_URL")
 _USING_POSTGRES = bool(DATABASE_URL)
+_logger = logging.getLogger(__name__)
 
 if _USING_POSTGRES:
     try:
         import psycopg
+        from psycopg_pool import ConnectionPool
         from psycopg.rows import dict_row
     except ImportError as exc:
         raise RuntimeError(
             "DATABASE_URL is set, but PostgreSQL dependencies are missing. "
-            "Install psycopg[binary] and langgraph-checkpoint-postgres."
+            "Install psycopg[binary], psycopg-pool, and "
+            "langgraph-checkpoint-postgres."
         ) from exc
     if PostgresSaver is None:
         raise RuntimeError(
             "DATABASE_URL is set, but langgraph-checkpoint-postgres is missing."
         )
-    _AUTH_DB = psycopg.connect(
-        DATABASE_URL,
-        autocommit=True,
-        row_factory=dict_row,
+
+    _POSTGRES_POOLS = []
+    _POSTGRES_POOL_LOCK = threading.RLock()
+    _POSTGRES_SHUTDOWN = False
+
+    def _pool_size(name: str, default: int) -> int:
+        value = os.getenv(name, str(default))
+        try:
+            size = int(value)
+        except ValueError as exc:
+            raise RuntimeError(f"{name} must be a positive integer.") from exc
+        if size < 1:
+            raise RuntimeError(f"{name} must be a positive integer.")
+        return size
+
+    def _create_postgres_pool(
+        *,
+        min_size: int,
+        max_size: int,
+    ) -> ConnectionPool:
+        pool = ConnectionPool(
+            DATABASE_URL,
+            kwargs={"autocommit": True, "row_factory": dict_row},
+            min_size=min_size,
+            max_size=max_size,
+            timeout=10,
+            check=ConnectionPool.check_connection,
+            open=True,
+        )
+        _POSTGRES_POOLS.append(pool)
+        return pool
+
+    def _close_postgres_pools() -> None:
+        global _POSTGRES_SHUTDOWN
+        with _POSTGRES_POOL_LOCK:
+            _POSTGRES_SHUTDOWN = True
+            for pool in _POSTGRES_POOLS:
+                pool.close()
+            _POSTGRES_POOLS.clear()
+
+    _AUTH_POOL_MAX_SIZE = _pool_size("POSTGRES_AUTH_POOL_MAX_SIZE", 2)
+    _CHECKPOINT_POOL_MAX_SIZE = _pool_size(
+        "POSTGRES_CHECKPOINT_POOL_MAX_SIZE", 2
     )
+    _AUTH_DB = _create_postgres_pool(min_size=1, max_size=_AUTH_POOL_MAX_SIZE)
+
+    def _get_postgres_pool() -> ConnectionPool:
+        global _AUTH_DB
+        with _POSTGRES_POOL_LOCK:
+            if _POSTGRES_SHUTDOWN:
+                raise RuntimeError("PostgreSQL pools are shut down.")
+            if _AUTH_DB.closed:
+                old_pool = _AUTH_DB
+                old_pool.close()
+                if old_pool in _POSTGRES_POOLS:
+                    _POSTGRES_POOLS.remove(old_pool)
+                _AUTH_DB = _create_postgres_pool(
+                    min_size=1,
+                    max_size=_AUTH_POOL_MAX_SIZE,
+                )
+            return _AUTH_DB
+
+    atexit.register(_close_postgres_pools)
 else:
     _AUTH_DB = sqlite3.connect(
         os.getenv("SQLITE_DB_PATH", "chatbot.db"),
@@ -97,10 +159,11 @@ _AUTH_SCHEMA = """
 """
 
 if _USING_POSTGRES:
-    with _AUTH_DB.cursor() as cursor:
-        for statement in _AUTH_SCHEMA.split(";"):
-            if statement.strip():
-                cursor.execute(statement)
+    with _AUTH_DB.connection() as connection:
+        with connection.cursor() as cursor:
+            for statement in _AUTH_SCHEMA.split(";"):
+                if statement.strip():
+                    cursor.execute(statement)
 else:
     _AUTH_DB.executescript(_AUTH_SCHEMA)
     _AUTH_DB.commit()
@@ -109,9 +172,11 @@ else:
 def _db_execute(query: str, parameters: tuple = ()):
     if _USING_POSTGRES:
         query = query.replace("?", "%s")
-        cursor = _AUTH_DB.cursor()
-        cursor.execute(query, parameters)
-        return cursor
+
+        with _get_postgres_pool().connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(query, parameters)
+        return None
     return _AUTH_DB.execute(query, parameters)
 
 
@@ -121,26 +186,33 @@ def _db_commit() -> None:
 
 
 def _db_fetchone(query: str, parameters: tuple = ()):
+    if _USING_POSTGRES:
+        query = query.replace("?", "%s")
+        with _get_postgres_pool().connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(query, parameters)
+                return cursor.fetchone()
+
     cursor = _db_execute(query, parameters)
-    try:
-        return cursor.fetchone()
-    finally:
-        if _USING_POSTGRES:
-            cursor.close()
+    return cursor.fetchone()
 
 
 def _db_fetchall(query: str, parameters: tuple = ()):
+    if _USING_POSTGRES:
+        query = query.replace("?", "%s")
+        with _get_postgres_pool().connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(query, parameters)
+                return cursor.fetchall()
+
     cursor = _db_execute(query, parameters)
-    try:
-        return cursor.fetchall()
-    finally:
-        if _USING_POSTGRES:
-            cursor.close()
+    return cursor.fetchall()
 
 
 def _db_rollback() -> None:
-    if not _USING_POSTGRES:
-        _AUTH_DB.rollback()
+    if _USING_POSTGRES:
+        return
+    _AUTH_DB.rollback()
 
 
 def _ensure_thread_title_column() -> None:
@@ -392,7 +464,6 @@ _RAG_STORE_DIR = Path(
     )
 )
 _RAG_STORE_VERSION = 2
-_logger = logging.getLogger(__name__)
 _RAG_STORE_WRITE_RETRIES = 5
 _RAG_STORE_WRITE_LOCK = threading.RLock()
 
@@ -722,10 +793,9 @@ tool_node = ToolNode(tools)
 # 6. Checkpointer
 # -------------------
 if _USING_POSTGRES:
-    _CHECKPOINT_DB = psycopg.connect(
-        DATABASE_URL,
-        autocommit=True,
-        row_factory=dict_row,
+    _CHECKPOINT_DB = _create_postgres_pool(
+        min_size=1,
+        max_size=_CHECKPOINT_POOL_MAX_SIZE,
     )
     checkpointer = PostgresSaver(_CHECKPOINT_DB)
     checkpointer.setup()

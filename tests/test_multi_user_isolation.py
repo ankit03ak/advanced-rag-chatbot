@@ -1,6 +1,7 @@
 import os
 import sys
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
@@ -49,10 +50,20 @@ def test_users_cannot_upload_or_read_documents_for_another_thread():
 
 def test_logout_invalidates_the_session():
     token = _login(f"user_{uuid.uuid4().hex}")
+    assert backend.session_is_valid(token)
     backend.logout_user(token)
 
+    assert not backend.session_is_valid(token)
     with pytest.raises(PermissionError):
         backend.retrieve_user_threads(token)
+
+
+def test_concurrent_authentication_operations():
+    usernames = [f"user_{uuid.uuid4().hex}" for _ in range(8)]
+    with ThreadPoolExecutor(max_workers=len(usernames)) as executor:
+        tokens = list(executor.map(_login, usernames))
+
+    assert all(backend.session_is_valid(token) for token in tokens)
 
 
 def test_authenticated_graph_stream_uses_runtime_session_metadata(monkeypatch):
@@ -81,6 +92,8 @@ def test_authenticated_graph_stream_uses_runtime_session_metadata(monkeypatch):
     )
 
     assert chunks
+    conversation = backend.get_conversation(token, thread_id)
+    assert conversation[-1].content == "authenticated response"
 
 
 def test_graph_rejects_another_users_thread(monkeypatch):

@@ -13,8 +13,8 @@ jobs:
     timeout-minutes: 10
     env:
       GOOGLE_API_KEY: test-key
-      SQLITE_DB_PATH: ${{ runner.temp }}/chatbot-test.db
-      RAG_STORE_DIR: ${{ runner.temp }}/rag-stores
+      SQLITE_DB_PATH: ${{ github.workspace }}/.ci-data/chatbot-test.db
+      RAG_STORE_DIR: ${{ github.workspace }}/.ci-data/rag-stores
 
     steps:
       - name: Check out repository
@@ -31,6 +31,9 @@ jobs:
 
       - name: Compile Python modules
         run: python -m compileall -q langraph_rag_backend_dep.py streamlit_rag_frontend_dep.py
+
+      - name: Prepare test storage
+        run: mkdir -p "$RAG_STORE_DIR" "$(dirname "$SQLITE_DB_PATH")"
 
       - name: Run tests
         run: python -m pytest -q

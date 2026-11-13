@@ -97,6 +97,15 @@ if _USING_POSTGRES:
             check=ConnectionPool.check_connection,
             open=True,
         )
+        try:
+            pool.wait(timeout=10)
+        except Exception as exc:
+            pool.close()
+            raise RuntimeError(
+                "Unable to initialize the PostgreSQL connection pool. "
+                "Verify that DATABASE_URL contains the current Supabase "
+                "host, project-specific username, password, and sslmode."
+            ) from exc
         _POSTGRES_POOLS.append(pool)
         return pool
 
